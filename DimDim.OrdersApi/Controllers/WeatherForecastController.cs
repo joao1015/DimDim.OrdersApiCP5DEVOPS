@@ -3,13 +3,13 @@
 namespace DimDim.OrdersApi.Controllers
 {
     [ApiController]
-    [Route("[controller]")]
+    [Route("api/[controller]")]
     public class WeatherForecastController : ControllerBase
     {
         [HttpGet]
         public IActionResult Get()
         {
-            return Ok("WeatherForecastController ativo, mas não utilizado.");
+            return Ok(new { status = "ok", note = "Controller presente apenas para evitar erro de build." });
         }
     }
 }
