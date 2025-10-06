@@ -15,4 +15,7 @@
 		<PackageReference Include="Swashbuckle.AspNetCore" Version="6.6.2" />
 		<PackageReference Include="Azure.Monitor.OpenTelemetry.AspNetCore" Version="1.2.0" />
 	</ItemGroup>
+	<ItemGroup>
+	  <Folder Include="Controllers\" />
+	</ItemGroup>
 </Project>
