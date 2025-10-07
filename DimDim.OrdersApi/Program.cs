@@ -7,10 +7,20 @@ using Microsoft.OpenApi.Models;
 
 var builder = WebApplication.CreateBuilder(args);
 
-// DB: SQL Server (Azure SQL em produção; local pode usar SQLEXPRESS ou Docker)
+// ==== DB: SQL Server (Azure) ou fallback InMemory se faltar CS ====
 var cs = builder.Configuration.GetConnectionString("SqlServer")
          ?? Environment.GetEnvironmentVariable("SQLSERVER_CONNECTIONSTRING");
-builder.Services.AddDbContext<AppDbContext>(opt => opt.UseSqlServer(cs));
+
+if (!string.IsNullOrWhiteSpace(cs))
+{
+    builder.Services.AddDbContext<AppDbContext>(opt => opt.UseSqlServer(cs));
+}
+else
+{
+    // Fallback para não derrubar a aplicação quando não houver CS (ex.: variável faltando)
+    builder.Services.AddDbContext<AppDbContext>(opt => opt.UseInMemoryDatabase("DimDimFallback"));
+    Console.Error.WriteLine("[WARN] SQLSERVER_CONNECTIONSTRING ausente. Usando InMemory TEMPORARIAMENTE.");
+}
 
 // Telemetry (Application Insights via Azure Monitor OTEL)
 builder.Services.AddDimDimTelemetry(builder.Configuration);
@@ -29,28 +39,44 @@ builder.Services.AddSwaggerGen(c =>
 
 var app = builder.Build();
 
-// Migrar automaticamente (opcional; útil no App Service)
+// ==== Healthz para diagnóstico no Azure ====
+app.MapGet("/healthz", () =>
+{
+    var env = app.Environment.EnvironmentName;
+    return Results.Ok(new { status = "ok", env });
+}).ExcludeFromDescription();
+
+// ==== Migrations com proteção (não derruba o site se falhar) ====
 using (var scope = app.Services.CreateScope())
 {
-    var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
-    await db.Database.MigrateAsync();
+    try
+    {
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        await db.Database.MigrateAsync();
+    }
+    catch (Exception ex)
+    {
+        Console.Error.WriteLine($"[Startup][Migrate] Falha ao aplicar migrations: {ex}");
+        // Não relança — mantém o site de pé para ver logs/healthz
+    }
 }
 
+// ==== Swagger em Dev ou quando ENABLE_SWAGGER=true ====
 var enableSwagger = Environment.GetEnvironmentVariable("ENABLE_SWAGGER") == "true";
-
 if (app.Environment.IsDevelopment() || enableSwagger)
 {
     app.UseSwagger();
     app.UseSwaggerUI(c =>
     {
         c.SwaggerEndpoint("/swagger/v1/swagger.json", "DimDim Orders API v1");
-        c.RoutePrefix = "swagger"; // mantém o caminho /swagger
+        c.RoutePrefix = "swagger";
     });
 }
 
+// Redirect raiz -> /swagger
 app.MapGet("/", () => Results.Redirect("/swagger")).ExcludeFromDescription();
 
-// Listar ordens (pagina + filtros)
+// =============== ENDPOINTS ===============
 app.MapGet("/api/orders", async (AppDbContext db, int page = 1, int pageSize = 10, string? area = null, string? technician = null, OrderStatus? status = null) =>
 {
     var q = db.ServiceOrders.AsNoTracking().Include(o => o.Parts).AsQueryable();
@@ -74,7 +100,6 @@ app.MapGet("/api/orders", async (AppDbContext db, int page = 1, int pageSize = 1
 .WithName("ListOrders")
 .Produces<PagedResult<ServiceOrderOut>>(200);
 
-// Buscar por Id
 app.MapGet("/api/orders/{id:guid}", async (AppDbContext db, Guid id) =>
 {
     var o = await db.ServiceOrders.Include(x => x.Parts).FirstOrDefaultAsync(x => x.Id == id);
@@ -88,7 +113,6 @@ app.MapGet("/api/orders/{id:guid}", async (AppDbContext db, Guid id) =>
 .WithName("GetOrder")
 .Produces<ServiceOrderOut>(200).Produces(404);
 
-// Criar
 app.MapPost("/api/orders", async (AppDbContext db, ServiceOrderCreateIn body) =>
 {
     var order = new ServiceOrder
@@ -106,7 +130,6 @@ app.MapPost("/api/orders", async (AppDbContext db, ServiceOrderCreateIn body) =>
 .WithName("CreateOrder")
 .Produces(201);
 
-// Atualizar (PUT substitui conteúdo)
 app.MapPut("/api/orders/{id:guid}", async (AppDbContext db, Guid id, ServiceOrderUpdateIn body) =>
 {
     var order = await db.ServiceOrders.Include(o => o.Parts).FirstOrDefaultAsync(o => o.Id == id);
@@ -117,7 +140,6 @@ app.MapPut("/api/orders/{id:guid}", async (AppDbContext db, Guid id, ServiceOrde
     order.TechnicianName = body.TechnicianName;
     order.Status = body.Status;
 
-    // Resetar peças (simples) — poderia ser PATCH mais granular
     db.ServiceParts.RemoveRange(order.Parts);
     order.Parts = body.Parts.Select(p => new ServicePart { PartName = p.PartName, Quantity = p.Quantity, UnitPrice = p.UnitPrice }).ToList();
 
@@ -127,7 +149,6 @@ app.MapPut("/api/orders/{id:guid}", async (AppDbContext db, Guid id, ServiceOrde
 .WithName("UpdateOrder")
 .Produces(204).Produces(404);
 
-// Excluir
 app.MapDelete("/api/orders/{id:guid}", async (AppDbContext db, Guid id) =>
 {
     var order = await db.ServiceOrders.FindAsync(id);
