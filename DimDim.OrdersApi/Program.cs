@@ -1,4 +1,4 @@
-using DimDim.OrdersApi.Data;
+ï»¿using DimDim.OrdersApi.Data;
 using DimDim.OrdersApi.Dtos;
 using DimDim.OrdersApi.Models;
 using DimDim.OrdersApi.Observability;
@@ -7,7 +7,7 @@ using Microsoft.OpenApi.Models;
 
 var builder = WebApplication.CreateBuilder(args);
 
-// ==== DB: SQL Server (Azure) ou fallback InMemory se faltar CS ====
+// ==== DB (SQL Server na nuvem; InMemory no local, se nÃ£o houver CS) ====
 var cs = builder.Configuration.GetConnectionString("SqlServer")
          ?? Environment.GetEnvironmentVariable("SQLSERVER_CONNECTIONSTRING");
 
@@ -17,15 +17,21 @@ if (!string.IsNullOrWhiteSpace(cs))
 }
 else
 {
-    // Fallback para não derrubar a aplicação quando não houver CS (ex.: variável faltando)
-    builder.Services.AddDbContext<AppDbContext>(opt => opt.UseInMemoryDatabase("DimDimFallback"));
-    Console.Error.WriteLine("[WARN] SQLSERVER_CONNECTIONSTRING ausente. Usando InMemory TEMPORARIAMENTE.");
+    builder.Services.AddDbContext<AppDbContext>(opt => opt.UseInMemoryDatabase("DimDimOrdersDb"));
 }
 
-// Telemetry (Application Insights via Azure Monitor OTEL)
-builder.Services.AddDimDimTelemetry(builder.Configuration);
+// ==== Telemetry (Application Insights via Azure Monitor) ====
+// SÃ³ registra se existir a connection string (no Azure seu script injeta isso)
+var aiCs =
+    builder.Configuration["APPLICATIONINSIGHTS_CONNECTION_STRING"]
+    ?? Environment.GetEnvironmentVariable("APPLICATIONINSIGHTS_CONNECTION_STRING");
 
-// Swagger
+if (!string.IsNullOrWhiteSpace(aiCs))
+{
+    builder.Services.AddDimDimTelemetry(builder.Configuration);
+}
+
+// ==== Swagger ====
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen(c =>
 {
@@ -33,32 +39,18 @@ builder.Services.AddSwaggerGen(c =>
     {
         Title = "DimDim Orders API",
         Version = "v1",
-        Description = "API de Ordens de Serviço (DimDim) com master–detail (ordem/peças)."
+        Description = "API de Ordens de ServiÃ§o (DimDim) com masterâ€“detail (ordem/peÃ§as)."
     });
 });
 
 var app = builder.Build();
 
-// ==== Healthz para diagnóstico no Azure ====
-app.MapGet("/healthz", () =>
+// ==== MigraÃ§Ã£o automÃ¡tica sÃ³ quando usando SQL Server ====
+if (!string.IsNullOrWhiteSpace(cs))
 {
-    var env = app.Environment.EnvironmentName;
-    return Results.Ok(new { status = "ok", env });
-}).ExcludeFromDescription();
-
-// ==== Migrations com proteção (não derruba o site se falhar) ====
-using (var scope = app.Services.CreateScope())
-{
-    try
-    {
-        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
-        await db.Database.MigrateAsync();
-    }
-    catch (Exception ex)
-    {
-        Console.Error.WriteLine($"[Startup][Migrate] Falha ao aplicar migrations: {ex}");
-        // Não relança — mantém o site de pé para ver logs/healthz
-    }
+    using var scope = app.Services.CreateScope();
+    var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+    await db.Database.MigrateAsync();
 }
 
 // ==== Swagger em Dev ou quando ENABLE_SWAGGER=true ====
@@ -73,25 +65,42 @@ if (app.Environment.IsDevelopment() || enableSwagger)
     });
 }
 
-// Redirect raiz -> /swagger
+// Raiz redireciona para Swagger
 app.MapGet("/", () => Results.Redirect("/swagger")).ExcludeFromDescription();
 
-// =============== ENDPOINTS ===============
-app.MapGet("/api/orders", async (AppDbContext db, int page = 1, int pageSize = 10, string? area = null, string? technician = null, OrderStatus? status = null) =>
+// =================== ENDPOINTS ===================
+
+// Listar ordens (pagina + filtros)
+app.MapGet("/api/orders", async (
+    AppDbContext db,
+    int page = 1,
+    int pageSize = 10,
+    string? area = null,
+    string? technician = null,
+    OrderStatus? status = null) =>
 {
     var q = db.ServiceOrders.AsNoTracking().Include(o => o.Parts).AsQueryable();
-    if (!string.IsNullOrWhiteSpace(area)) q = q.Where(o => o.Area == area);
-    if (!string.IsNullOrWhiteSpace(technician)) q = q.Where(o => o.TechnicianName == technician);
-    if (status.HasValue) q = q.Where(o => o.Status == status);
+
+    if (!string.IsNullOrWhiteSpace(area))
+        q = q.Where(o => o.Area == area);
+
+    if (!string.IsNullOrWhiteSpace(technician))
+        q = q.Where(o => o.TechnicianName == technician);
+
+    if (status.HasValue)
+        q = q.Where(o => o.Status == status);
 
     var total = await q.LongCountAsync();
+
     var items = await q.OrderByDescending(o => o.CreatedAtUtc)
                        .Skip((page - 1) * pageSize)
                        .Take(pageSize)
                        .Select(o => new ServiceOrderOut(
                            o.Id, o.ServiceName, o.Area, o.TechnicianName,
                            o.Status, o.CreatedAtUtc, o.TotalCost,
-                           o.Parts.Select(p => new ServicePartOut(p.Id, p.PartName, p.Quantity, p.UnitPrice, p.Quantity * p.UnitPrice)).ToList()
+                           o.Parts.Select(p => new ServicePartOut(
+                               p.Id, p.PartName, p.Quantity, p.UnitPrice, p.Quantity * p.UnitPrice
+                           )).ToList()
                        ))
                        .ToListAsync();
 
@@ -100,19 +109,26 @@ app.MapGet("/api/orders", async (AppDbContext db, int page = 1, int pageSize = 1
 .WithName("ListOrders")
 .Produces<PagedResult<ServiceOrderOut>>(200);
 
+// Buscar por Id
 app.MapGet("/api/orders/{id:guid}", async (AppDbContext db, Guid id) =>
 {
     var o = await db.ServiceOrders.Include(x => x.Parts).FirstOrDefaultAsync(x => x.Id == id);
     if (o is null) return Results.NotFound();
+
     var dto = new ServiceOrderOut(
         o.Id, o.ServiceName, o.Area, o.TechnicianName, o.Status, o.CreatedAtUtc, o.TotalCost,
-        o.Parts.Select(p => new ServicePartOut(p.Id, p.PartName, p.Quantity, p.UnitPrice, p.Quantity * p.UnitPrice)).ToList()
+        o.Parts.Select(p => new ServicePartOut(
+            p.Id, p.PartName, p.Quantity, p.UnitPrice, p.Quantity * p.UnitPrice
+        )).ToList()
     );
+
     return Results.Ok(dto);
 })
 .WithName("GetOrder")
-.Produces<ServiceOrderOut>(200).Produces(404);
+.Produces<ServiceOrderOut>(200)
+.Produces(404);
 
+// Criar
 app.MapPost("/api/orders", async (AppDbContext db, ServiceOrderCreateIn body) =>
 {
     var order = new ServiceOrder
@@ -121,15 +137,23 @@ app.MapPost("/api/orders", async (AppDbContext db, ServiceOrderCreateIn body) =>
         Area = body.Area,
         TechnicianName = body.TechnicianName,
         Status = body.Status,
-        Parts = body.Parts.Select(p => new ServicePart { PartName = p.PartName, Quantity = p.Quantity, UnitPrice = p.UnitPrice }).ToList()
+        Parts = body.Parts.Select(p => new ServicePart
+        {
+            PartName = p.PartName,
+            Quantity = p.Quantity,
+            UnitPrice = p.UnitPrice
+        }).ToList()
     };
+
     db.ServiceOrders.Add(order);
     await db.SaveChangesAsync();
+
     return Results.CreatedAtRoute("GetOrder", new { id = order.Id }, new { order.Id });
 })
 .WithName("CreateOrder")
 .Produces(201);
 
+// Atualizar (PUT substitui conteÃºdo)
 app.MapPut("/api/orders/{id:guid}", async (AppDbContext db, Guid id, ServiceOrderUpdateIn body) =>
 {
     var order = await db.ServiceOrders.Include(o => o.Parts).FirstOrDefaultAsync(o => o.Id == id);
@@ -140,24 +164,34 @@ app.MapPut("/api/orders/{id:guid}", async (AppDbContext db, Guid id, ServiceOrde
     order.TechnicianName = body.TechnicianName;
     order.Status = body.Status;
 
+    // Simples: remove todas as peÃ§as e recria
     db.ServiceParts.RemoveRange(order.Parts);
-    order.Parts = body.Parts.Select(p => new ServicePart { PartName = p.PartName, Quantity = p.Quantity, UnitPrice = p.UnitPrice }).ToList();
+    order.Parts = body.Parts.Select(p => new ServicePart
+    {
+        PartName = p.PartName,
+        Quantity = p.Quantity,
+        UnitPrice = p.UnitPrice
+    }).ToList();
 
     await db.SaveChangesAsync();
     return Results.NoContent();
 })
 .WithName("UpdateOrder")
-.Produces(204).Produces(404);
+.Produces(204)
+.Produces(404);
 
+// Excluir
 app.MapDelete("/api/orders/{id:guid}", async (AppDbContext db, Guid id) =>
 {
     var order = await db.ServiceOrders.FindAsync(id);
     if (order is null) return Results.NotFound();
+
     db.Remove(order);
     await db.SaveChangesAsync();
     return Results.NoContent();
 })
 .WithName("DeleteOrder")
-.Produces(204).Produces(404);
+.Produces(204)
+.Produces(404);
 
 app.Run();
